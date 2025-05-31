@@ -1,0 +1,29 @@
+#!/bin/bash
+
+targetdir="$*"
+if [ ! -z "$1" ]
+then
+    if [ -d "${targetdir}" ]
+    then
+        oldpwd=$(pwd)
+    else
+        echo "Not a valid directory."
+        return 1
+    fi
+fi
+
+cd "${targetdir}"
+fncounter=0
+for fn in *
+do
+    newfn=$(printf "${fn}" | tr ' ' '_')
+    if [ "${newfn}" != "${fn}" ]
+    then
+        mv "${fn}" "${newfn}"
+        fncounter=$((${fncounter}+1))
+    fi
+done
+cd "${oldpwd}"
+echo "Successfully replaced spaces by underscores in ${fncounter} filename(s)."
+echo
+unset targetdir oldpwd REPLY fncounter fn newfn

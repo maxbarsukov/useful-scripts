@@ -1,0 +1,995 @@
+#!/bin/bash
+# @author https://github.com/maxbarsukov
+
+# ----------------------------------------
+# Function to display help information
+# ----------------------------------------
+show_help() {
+    cat <<EOF
+USAGE: $0 [OPTIONS] [FILE_OR_DIRECTORY]
+
+Recursively output contents of files, respecting ignore rules.
+
+OPTIONS:
+  -R, --recommended        Use recommended settings (color, tree, metadata, max-size=5K)
+  -l, --long               Output full content of files over 1000 lines
+  -p, --less               Use pager for output (requires 'less')
+  -i, --include PATTERN    Only process files matching pattern (e.g., '*.txt')
+  -e, --exclude PATTERN    Exclude files matching pattern (e.g., '*.log')
+  -s, --max-size SIZE      Skip files larger than specified size (e.g., 10M, 100K)
+  -o, --output FILE        Write output to file instead of stdout
+  -c, --color              Enable syntax highlighting and colored output
+  -f, --follow             Follow symbolic links to targets
+  -P, --progress           Show progress during large directory scans
+  -d, --dry-run            List files without showing content
+  -n, --number             Print line numbers
+  -F, --full-path          Show full absolute paths
+  -j, --jobs N             Use N parallel jobs for processing
+  -t, --tree               Print file tree structure before content
+  -I, --ignore-file FILE   Specify custom ignore file (gitignore format)
+  -G, --no-gitignore       Disable automatic .gitignore processing
+  -D, --max-depth N        Maximum directory depth to search
+  -C, --clipboard          Copy output to clipboard if possible
+  --force-ignore-emulation Force using custom ignore system instead of git
+  --ignore-case            Case-insensitive pattern matching
+  --meta                   Show file metadata in header
+  --checksum               Include file checksum in header
+  --newer-than DATE        Only show files newer than date (YYYY-MM-DD)
+  --older-than DATE        Only show files older than date (YYYY-MM-DD)
+  --interactive            Prompt before showing each file
+  --silent                 Suppress warnings and non-critical errors
+  -h, --help               Show this help message
+
+EXAMPLES:
+  $0 -R file.txt           # Use recommended settings on a file
+  $0 -l -i '*.sh'          # Process current directory
+  $0 -s 1M -o output.txt -n /path
+  $0 -p -c -F -t -D 3      # With clipboard and tree
+  $0 --force-ignore-emulation --silent
+EOF
+}
+
+# ----------------------------------------
+# Function to parse human-readable sizes
+# ----------------------------------------
+parse_size() {
+    local size_str=$1
+    if [[ $size_str =~ ^([0-9]+)([kKmMgGtT]?)[bB]?$ ]]; then
+        local size=${BASH_REMATCH[1]}
+        local unit=${BASH_REMATCH[2],,}
+        case "$unit" in
+            k) echo $((size * 1024)) ;;
+            m) echo $((size * 1024 * 1024)) ;;
+            g) echo $((size * 1024 * 1024 * 1024)) ;;
+            t) echo $((size * 1024 * 1024 * 1024 * 1024)) ;;
+            *) echo "$size" ;;
+        esac
+    else
+        echo "Error: Invalid size format '$size_str'" >&2
+        exit 1
+    fi
+}
+
+# ----------------------------------------
+# Function to parse dates for age filtering
+# ----------------------------------------
+parse_date() {
+    local date_str="$1"
+    # Try ISO format first
+    local ts
+    ts=$(date -d "$date_str" +%s 2>/dev/null) || ts=""
+    if [[ -n "$ts" ]]; then
+        echo "$ts"
+        return
+    fi
+
+    # Try relative formats
+    case "$date_str" in
+        today)     ts=$(date -d "00:00" +%s) ;;
+        yesterday) ts=$(date -d "yesterday 00:00" +%s) ;;
+        thisweek)  ts=$(date -d "last monday" +%s) ;;
+        lastweek)  ts=$(date -d "last monday -7 days" +%s) ;;
+        *)         ts=$(date -d "$date_str" +%s 2>/dev/null) ;;
+    esac
+
+    if [[ -z "$ts" ]]; then
+        echo "Error: Invalid date format '$date_str'" >&2
+        exit 1
+    fi
+    echo "$ts"
+}
+
+# ----------------------------------------
+# Function to detect binary files
+# ----------------------------------------
+is_binary() {
+    local file="$1"
+    # Empty files are not binary
+    [[ ! -s "$file" ]] && return 1
+
+    # Use file command if available
+    if command -v file &>/dev/null; then
+        file -b --mime-encoding "$file" | grep -q 'binary' && return 0
+    fi
+
+    # Fallback to grep method
+    ! grep -Iq . "$file" 2>/dev/null
+}
+
+# ----------------------------------------
+# Function to calculate checksum
+# ----------------------------------------
+get_checksum() {
+    local file="$1"
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$file" | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$file" | cut -d' ' -f1
+    else
+        echo "N/A"
+    fi
+}
+
+# ----------------------------------------
+# Function to get file metadata
+# ----------------------------------------
+get_metadata() {
+    local file="$1"
+    stat -c "Size: %s | Perms: %A | Owner: %U | Modified: %y" "$file" 2>/dev/null ||
+    stat -f "Size: %z | Perms: %Sp | Owner: %u | Modified: %Sm" "$file" 2>/dev/null
+}
+
+# ----------------------------------------
+# Function to copy to clipboard
+# ----------------------------------------
+copy_to_clipboard() {
+    local content="$1"
+    local silent="$2"
+    if command -v pbcopy &>/dev/null; then
+        echo -n "$content" | pbcopy
+    elif command -v xclip &>/dev/null; then
+        echo -n "$content" | xclip -selection clipboard
+    else
+        $silent || echo "Error: No clipboard utility found (install pbcopy or xclip)" >&2
+        return 1
+    fi
+}
+
+# ----------------------------------------
+# Function to remove ANSI escape codes
+# ----------------------------------------
+strip_ansi() {
+    perl -pe 's/\e\[[0-9;]*m//g'
+}
+
+# ----------------------------------------
+# Function to collect ignore patterns from .gitignore files
+# ----------------------------------------
+collect_ignore_patterns() {
+    local root_dir="$1"
+    local -n patterns_ref="$2"
+
+    # Always ignore .git directory
+    patterns_ref+=(".git")
+
+    local ignore_files=()
+    while IFS= read -r -d $'\0' ignore_file; do
+        ignore_files+=("$ignore_file")
+    done < <(find "$root_dir" -name .gitignore -print0 2>/dev/null)
+
+    for ignore_file in "${ignore_files[@]}"; do
+        local dir_path
+        dir_path=$(dirname "$ignore_file")
+        local rel_path=${dir_path#$root_dir/}
+
+        while IFS= read -r pattern; do
+            [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+            if [[ "$pattern" == /* ]]; then
+                pattern="${pattern#/}"
+            else
+                pattern="$rel_path/$pattern"
+            fi
+            patterns_ref+=("$pattern")
+        done < "$ignore_file"
+    done
+}
+
+# ----------------------------------------
+# Function to apply ignore patterns to a list of files
+# ----------------------------------------
+apply_ignore_patterns() {
+    local -n files_ref="$1"
+    shift
+    local patterns=("$@")
+    local new_list=()
+
+    for file in "${files_ref[@]}"; do
+        local skip=false
+        for pattern in "${patterns[@]}"; do
+            [[ "$file" == $pattern ]] && { skip=true; break; }
+        done
+        $skip || new_list+=("$file")
+    done
+
+    files_ref=("${new_list[@]}")
+}
+
+# ----------------------------------------
+# Helper: Check if a path (file or directory) should be printed at all.
+# Returns 0 if:
+#   – it's a file that passes include/exclude tests, size, age, etc., or
+#   – it's a directory with at least one descendant (file or directory) that would print.
+# Otherwise returns 1.
+# ----------------------------------------
+tree_should_print() {
+    local path="$1"
+    local max_depth="$2"
+    local ignore_patterns_str="$3"
+    local include_patterns_str="$4"
+    local depth
+    local rel_path
+
+    # Compute relative path from ROOT_DIR
+    if [[ "$path" == "$ROOT_DIR" ]]; then
+        rel_path="."
+        depth=0
+    else
+        rel_path="${path#$ROOT_DIR/}"
+        # Count slashes to determine depth
+        local tmp="${rel_path//[^\/]/}"
+        depth=${#tmp}
+    fi
+
+    # Build arrays of ignore/include patterns
+    IFS='|' read -ra ignore_patterns <<< "$ignore_patterns_str"
+    IFS='|' read -ra include_patterns <<< "$include_patterns_str"
+
+    # 1) Check if rel_path should be skipped due to ignore_patterns
+    for pattern in "${ignore_patterns[@]}"; do
+        [[ -z "$pattern" ]] && continue
+        if [[ "$rel_path" == $pattern || "$rel_path" == $pattern/* || \
+              "$rel_path" == */$pattern || "$rel_path" == */$pattern/* ]]; then
+            return 1
+        fi
+    done
+
+    # 2) Check if include_patterns exist, and if so, ensure this path matches at least one include,
+    #    or has a descendant that matches.
+    if [[ ${#include_patterns[@]} -gt 0 && "${include_patterns[0]}" != "" ]]; then
+        local included=false
+        for pattern in "${include_patterns[@]}"; do
+            [[ -z "$pattern" ]] && continue
+            if [[ "$rel_path" == $pattern || "$rel_path" == $pattern/* || \
+                  "$rel_path" == */$pattern || "$rel_path" == */$pattern/* ]]; then
+                included=true
+                break
+            fi
+        done
+        # If it's a file and matches include, success. If it doesn't match include *AND* is a file, skip.
+        if [[ -f "$path" && ! $included ]]; then
+            return 1
+        fi
+        # If it's a directory and not included, we still might print it if a child matches;
+        # so do not return yet—continue to check children below.
+    fi
+
+    # 3) If this is a file, by this point we've passed ignore/include checks. Return success.
+    if [[ -f "$path" ]]; then
+        return 0
+    fi
+
+    # 4) If it's a directory, but we've reached max_depth (if specified), we can't descend.
+    if [[ -n "$max_depth" && "$depth" -ge "$max_depth" ]]; then
+        # At max depth: do not descend further. If include_patterns were set, maybe directory itself matched
+        # (that was checked above). Otherwise, skip.
+        for pattern in "${include_patterns[@]}"; do
+            [[ -z "$pattern" ]] && continue
+            if [[ "$rel_path" == $pattern ]]; then
+                return 0
+            fi
+        done
+        return 1
+    fi
+
+    # 5) Recurse into children to see if any descendant would print.
+    local found_child=false
+    local items=()
+    while IFS= read -r item; do
+        [[ -e "$path/$item" ]] && items+=("$item")
+    done < <(ls -A "$path" 2>/dev/null)
+
+    for item in "${items[@]}"; do
+        if tree_should_print "$path/$item" "$max_depth" "$ignore_patterns_str" "$include_patterns_str"; then
+            found_child=true
+            break
+        fi
+    done
+
+    $found_child && return 0 || return 1
+}
+
+# ----------------------------------------
+# Custom tree function:
+# Only prints a directory if tree_should_print says it (or one of its descendants) should print.
+# Prints files only if they pass the checks.
+# ----------------------------------------
+custom_tree() {
+    local path="$1"
+    local max_depth="$2"
+    local color_mode="$3"
+    local prefix="$4"
+    local ignore_patterns_str="$5"
+    local include_patterns_str="$6"
+
+    # Build arrays again (for pattern checks)
+    IFS='|' read -ra ignore_patterns <<< "$ignore_patterns_str"
+    IFS='|' read -ra include_patterns <<< "$include_patterns_str"
+
+    # First: see if we should print THIS path at all
+    if ! tree_should_print "$path" "$max_depth" "$ignore_patterns_str" "$include_patterns_str"; then
+        return 1
+    fi
+
+    # Compute relative path to decide printing label
+    local rel_path
+    if [[ "$path" == "$ROOT_DIR" ]]; then
+        rel_path="."
+    else
+        rel_path="${path#$ROOT_DIR/}"
+    fi
+
+    # Setup colors
+    local BLUE="" GREEN="" RESET=""
+    if $color_mode; then
+        BLUE='\033[0;34m'
+        GREEN='\033[0;32m'
+        RESET='\033[0m'
+    fi
+
+    # If this is a file, just print it (since we already know tree_should_print was success)
+    if [[ -f "$path" ]]; then
+        local name
+        name=$(basename "$path")
+        printf "${prefix}${GREEN}${name}${RESET}\n"
+        return 0
+    fi
+
+    # If we're here, it's a directory that should be printed (either it matched include or has a child to print).
+    # Print the directory name first:
+    local dir_name
+    dir_name=$(basename "$path")
+    printf "${prefix}${BLUE}${dir_name}/${RESET}\n"
+
+    # Compute current depth so we know if we hit max_depth
+    local depth
+    if [[ "$rel_path" == "." ]]; then
+        depth=0
+    else
+        local tmp="${rel_path//[^\/]/}"
+        depth=${#tmp}
+    fi
+
+    # If max_depth reached, do not descend further
+    if [[ -n "$max_depth" && "$depth" -ge "$max_depth" ]]; then
+        return 0
+    fi
+
+    # Gather children, but only recurse on those that tree_should_print
+    local items=() printed_children=0
+    while IFS= read -r item; do
+        [[ -e "$path/$item" ]] && items+=("$item")
+    done < <(ls -A "$path" 2>/dev/null)
+
+    local count=${#items[@]} idx=0
+    for item in "${items[@]}"; do
+        ((idx++))
+        local child_path="$path/$item"
+        # Check if this child subtree should be printed
+        if tree_should_print "$child_path" "$max_depth" "$ignore_patterns_str" "$include_patterns_str"; then
+            local new_prefix="$prefix"
+            if [[ $idx -eq $count ]]; then
+                new_prefix+="└── "
+            else
+                new_prefix+="├── "
+            fi
+            custom_tree "$child_path" "$max_depth" "$color_mode" "$new_prefix" \
+                        "$ignore_patterns_str" "$include_patterns_str"
+            ((printed_children++))
+        fi
+    done
+
+    # Return success if anything was printed here
+    [[ $printed_children -gt 0 ]] && return 0
+
+    return 1
+}
+
+# ----------------------------------------
+# Function to print directory tree
+# ----------------------------------------
+print_tree() {
+    local root_dir="$1"
+    local max_depth="$2"
+    local color_mode="$3"
+    local ignore_patterns_str="$4"
+    local include_patterns_str="$5"
+
+    # Setup colors
+    local BOLD="" CYAN="" RESET=""
+    if $color_mode; then
+        BOLD='\033[1m'
+        CYAN='\033[0;36m'
+        RESET='\033[0m'
+    fi
+
+    printf "${BOLD}${CYAN}============= Directory tree =============${RESET}\n"
+
+    # Ensure .git is ignored by default
+    if [[ -n "$ignore_patterns_str" ]]; then
+        ignore_patterns_str+="|.git"
+    else
+        ignore_patterns_str=".git"
+    fi
+
+    if command -v tree &>/dev/null; then
+        local tree_cmd=(tree -a --prune)
+
+        if [[ -n "$ignore_patterns_str" ]]; then
+            tree_cmd+=(-I "${ignore_patterns_str}")
+        fi
+        if [[ -n "$include_patterns_str" ]]; then
+            tree_cmd+=(-P "${include_patterns_str}")
+        fi
+        if [[ -n "$max_depth" ]]; then
+            tree_cmd+=(-L "$max_depth")
+        fi
+
+        "${tree_cmd[@]}" "$root_dir"
+    else
+        custom_tree "$root_dir" "$max_depth" "$color_mode" "" \
+                    "$ignore_patterns_str" "$include_patterns_str"
+    fi
+
+    echo -e "\n\n"
+}
+
+# ----------------------------------------
+# Function to process each file
+# ----------------------------------------
+process_file() {
+    local file="$1"
+    local root_dir="$2"
+    local long_mode="$3"
+    local color_mode="$4"
+    local max_size_bytes="$5"
+    local follow_symlinks="$6"
+    local include_patterns="$7"
+    local exclude_patterns="$8"
+    local dry_run="$9"
+    local number_mode="${10}"
+    local full_path_mode="${11}"
+    local show_metadata="${12}"
+    local show_checksum="${13}"
+    local newer_than_ts="${14}"
+    local older_than_ts="${15}"
+    local ignore_case="${16}"
+    local interactive_mode="${17}"
+    local silent_mode="${18}"
+
+    # Setup colors if enabled
+    local BOLD="" RED="" YELLOW="" CYAN="" RESET=""
+    if $color_mode; then
+        BOLD='\033[1m'
+        RED='\033[0;31m'
+        YELLOW='\033[0;33m'
+        CYAN='\033[0;36m'
+        RESET='\033[0m'
+    fi
+
+    # Determine how to display the file path
+    local display_file file_path
+    if [[ "$full_path_mode" == true ]]; then
+        display_file=$(realpath -- "$root_dir/$file" 2>/dev/null || echo "$root_dir/$file")
+    else
+        display_file="$file"
+    fi
+    file_path="$root_dir/$file"
+
+    # Case-insensitive matching if requested
+    local match_file="$file"
+    if $ignore_case; then
+        match_file="${file,,}"
+        include_patterns="${include_patterns,,}"
+        exclude_patterns="${exclude_patterns,,}"
+    fi
+
+    # Apply include patterns (space-separated)
+    if [[ -n "$include_patterns" ]]; then
+        local matched=false
+        for pattern in $include_patterns; do
+            [[ "$match_file" == $pattern ]] && { matched=true; break; }
+        done
+        $matched || return
+    fi
+
+    # Apply exclude patterns
+    if [[ -n "$exclude_patterns" ]]; then
+        for pattern in $exclude_patterns; do
+            [[ "$match_file" == $pattern ]] && return
+        done
+    fi
+
+    # Handle symbolic links
+    local target="" content_file="$file_path"
+    if [[ -L "$file_path" ]]; then
+        target=$(readlink -f "$file_path" 2>/dev/null)
+        if [[ -n "$target" && -e "$target" ]]; then
+            if $follow_symlinks; then
+                content_file="$target"
+                if $full_path_mode; then
+                    display_file="$display_file -> $(realpath -- "$target" 2>/dev/null || echo "$target")"
+                else
+                    display_file="$file -> $(realpath --relative-to="$root_dir" "$target" 2>/dev/null || echo "$target")"
+                fi
+            fi
+        else
+            printf "${BOLD}${RED}============= $display_file =============${RESET}\n"
+            printf "${RED}Skipped: Broken or invalid symlink${RESET}\n\n"
+            return
+        fi
+    fi
+
+    # Skip if not a regular file
+    [[ ! -f "$content_file" ]] && return
+
+    # Check file size
+    if [[ -n "$max_size_bytes" ]]; then
+        local size
+        size=$(stat -c %s "$content_file" 2>/dev/null || echo 0)
+        if (( size > max_size_bytes )); then
+            printf "${BOLD}${YELLOW}============= $display_file =============${RESET}\n"
+            printf "${YELLOW}Skipped: File size exceeds limit ($(numfmt --to=iec $size) > $(numfmt --to=iec $max_size_bytes))${RESET}\n\n"
+            return
+        fi
+    fi
+
+    # Check file modification time
+    local mtime_ts
+    mtime_ts=$(stat -c %Y "$content_file" 2>/dev/null)
+    if [[ -n "$mtime_ts" ]]; then
+        if [[ -n "$newer_than_ts" && "$mtime_ts" -lt "$newer_than_ts" ]]; then
+            printf "${BOLD}${YELLOW}============= $display_file =============${RESET}\n"
+            printf "${YELLOW}Skipped: File is older than specified date${RESET}\n\n"
+            return
+        fi
+        if [[ -n "$older_than_ts" && "$mtime_ts" -gt "$older_than_ts" ]]; then
+            printf "${BOLD}${YELLOW}============= $display_file =============${RESET}\n"
+            printf "${YELLOW}Skipped: File is newer than specified date${RESET}\n\n"
+            return
+        fi
+    fi
+
+    # Skip unreadable files
+    if [[ ! -r "$content_file" ]]; then
+        printf "${BOLD}${RED}============= $display_file =============${RESET}\n"
+        printf "${RED}Skipped: Permission denied${RESET}\n\n"
+        return
+    fi
+
+    # Skip binary files
+    if is_binary "$content_file"; then
+        printf "${BOLD}${YELLOW}============= $display_file =============${RESET}\n"
+        printf "${YELLOW}Skipped: Binary file${RESET}\n\n"
+        return
+    fi
+
+    # Count lines early for -l check
+    local line_count
+    line_count=$(wc -l < "$content_file" 2>/dev/null || echo 0)
+    if (( line_count > 1000 )) && ! $long_mode; then
+        printf "${BOLD}${YELLOW}============= $display_file =============${RESET}\n"
+        printf "${YELLOW}Skipped: File has $line_count lines (use -l for full output)${RESET}\n\n"
+        return
+    fi
+
+    # Interactive prompt (to stderr)
+    if $interactive_mode; then
+        echo "---" >&2
+        echo "File: $display_file" >&2
+        echo "Lines: $line_count" >&2
+        read -p "Show content? [y/N] " -n 1 -r >&2
+        echo >&2
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            printf "${YELLOW}Skipped by user request${RESET}\n\n" >&2
+            return
+        fi
+    fi
+
+    # Build header
+    local header="${BOLD}${CYAN}============= $display_file =============${RESET}"
+    if $show_metadata; then
+        header+=$'\n'"${CYAN}$(get_metadata "$content_file")${RESET}"
+    fi
+    if $show_checksum; then
+        header+=$'\n'"${CYAN}Checksum: $(get_checksum "$content_file")${RESET}"
+    fi
+
+    # Print header
+    printf "%b\n" "$header"
+
+    # Display content or dry-run notice
+    if $dry_run; then
+        printf "Dry-run: File would be displayed ($line_count lines)\n"
+    else
+        if $color_mode && command -v bat &>/dev/null; then
+            if $number_mode; then
+                bat --style=plain --color=always --paging=never --number -- "$content_file"
+            else
+                bat --style=plain --color=always --paging=never -- "$content_file"
+            fi
+        else
+            if $number_mode; then
+                nl -ba -w4 -s'  ' -- "$content_file"
+            else
+                cat -- "$content_file"
+            fi
+        fi
+    fi
+
+    printf "\n\n"
+}
+
+# Export functions needed for parallel processing
+export -f process_file parse_size parse_date is_binary get_metadata get_checksum strip_ansi
+export -f tree_should_print custom_tree
+
+# ----------------------------------------
+# Main script
+# ----------------------------------------
+main() {
+    # Default settings
+    local long_mode=false
+    local less_mode=false
+    local color_mode=false
+    local follow_symlinks=false
+    local progress_mode=false
+    local dry_run=false
+    local number_mode=false
+    local full_path_mode=false
+    local tree_mode=false
+    local no_gitignore=false
+    local ignore_case=false
+    local show_metadata=false
+    local show_checksum=false
+    local interactive_mode=false
+    local recommended_mode=false
+    local force_ignore_emulation=false
+    local silent_mode=false
+    local clipboard_mode=false
+
+    local max_size_bytes=""
+    local include_patterns=""
+    local exclude_patterns=""
+    local output_file=""
+    local ignore_file=""
+    local max_depth=""
+    local newer_than_ts=""
+    local older_than_ts=""
+
+    local parallel_jobs=0
+    local target="."
+    local root_dir=""
+    local is_file=false
+
+    local clipboard_content=""
+    local temp_file=""
+
+    declare -a ignore_patterns=()
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -R|--recommended)
+                recommended_mode=true
+                shift
+                ;;
+            -l|--long)
+                long_mode=true; shift
+                ;;
+            -p|--less)
+                less_mode=true; shift
+                ;;
+            -c|--color)
+                color_mode=true; shift
+                ;;
+            -f|--follow)
+                follow_symlinks=true; shift
+                ;;
+            -P|--progress)
+                progress_mode=true; shift
+                ;;
+            -d|--dry-run)
+                dry_run=true; shift
+                ;;
+            -n|--number)
+                number_mode=true; shift
+                ;;
+            -F|--full-path)
+                full_path_mode=true; shift
+                ;;
+            -t|--tree)
+                tree_mode=true; shift
+                ;;
+            -i|--include)
+                include_patterns+="$2 "; shift 2
+                ;;
+            -e|--exclude)
+                exclude_patterns+="$2 "; shift 2
+                ;;
+            -s|--max-size)
+                max_size_bytes=$(parse_size "$2"); shift 2
+                ;;
+            -o|--output)
+                output_file="$2"; shift 2
+                ;;
+            -I|--ignore-file)
+                ignore_file="$2"; shift 2
+                ;;
+            -G|--no-gitignore)
+                no_gitignore=true; shift
+                ;;
+            -D|--max-depth)
+                max_depth="$2"; shift 2
+                ;;
+            -j|--jobs)
+                parallel_jobs="$2"; shift 2
+                ;;
+            -C|--clipboard)
+                clipboard_mode=true; shift
+                ;;
+            --force-ignore-emulation)
+                force_ignore_emulation=true; shift
+                ;;
+            --ignore-case)
+                ignore_case=true; shift
+                ;;
+            --meta)
+                show_metadata=true; shift
+                ;;
+            --checksum)
+                show_checksum=true; shift
+                ;;
+            --newer-than)
+                newer_than_ts=$(parse_date "$2"); shift 2
+                ;;
+            --older-than)
+                older_than_ts=$(parse_date "$2"); shift 2
+                ;;
+            --interactive)
+                interactive_mode=true; shift
+                ;;
+            --silent)
+                silent_mode=true; shift
+                ;;
+            -h|--help)
+                show_help; exit 0
+                ;;
+            --)
+                shift; break
+                ;;
+            -*)
+                echo "Error: Unknown option $1" >&2
+                show_help
+                exit 1
+                ;;
+            *)
+                target="$1"; shift
+                ;;
+        esac
+    done
+
+    # Apply recommended settings
+    if $recommended_mode; then
+        color_mode=true
+        tree_mode=true
+        show_metadata=true
+        if [[ -z "$max_size_bytes" ]]; then
+            max_size_bytes=5120  # 5KB default
+        fi
+    fi
+
+    # Setup colors for main script
+    local BOLD="" RED="" YELLOW="" CYAN="" RESET=""
+    if $color_mode; then
+        BOLD='\033[1m'
+        RED='\033[0;31m'
+        YELLOW='\033[0;33m'
+        CYAN='\033[0;36m'
+        RESET='\033[0m'
+    fi
+
+    # Determine whether target is a file or directory
+    if [[ -f "$target" ]]; then
+        root_dir=$(dirname -- "$(realpath -- "$target")")
+        is_file=true
+    elif [[ -d "$target" ]]; then
+        root_dir=$(realpath -- "$target")
+    else
+        printf "${RED}Error: '$target' not found or invalid type${RESET}\n" >&2
+        exit 1
+    fi
+
+    # Handle output redirection
+    if [[ -n "$output_file" ]]; then
+        exec > "$output_file"
+    elif $less_mode; then
+        exec > >(less -R)
+    fi
+
+    # If using clipboard mode, capture stdout in a temp file
+    if $clipboard_mode; then
+        temp_file=$(mktemp)
+        exec 1> "$temp_file"
+    fi
+
+    # Define global ROOT_DIR for tree functions
+    export ROOT_DIR="$root_dir"
+
+    # Collect ignore patterns from .gitignore
+    if ! $no_gitignore; then
+        collect_ignore_patterns "$root_dir" ignore_patterns
+    fi
+
+    # Incorporate custom ignore file if specified
+    if [[ -n "$ignore_file" && -f "$ignore_file" ]]; then
+        while IFS= read -r pattern; do
+            [[ -n "$pattern" && ! "$pattern" =~ ^\# ]] && ignore_patterns+=("$pattern")
+        done < "$ignore_file"
+    fi
+
+    # Build pipe-delimited ignore string
+    local ignore_patterns_str=""
+    if [[ ${#ignore_patterns[@]} -gt 0 ]]; then
+        ignore_patterns_str="$(IFS='|'; echo "${ignore_patterns[*]}")"
+    fi
+    # Append exclude_patterns (space-separated) to ignore string
+    if [[ -n "$exclude_patterns" ]]; then
+        local ep_arr=($exclude_patterns)
+        local ep_str
+        ep_str="$(IFS='|'; echo "${ep_arr[*]}")"
+        if [[ -n "$ignore_patterns_str" ]]; then
+            ignore_patterns_str+="|$ep_str"
+        else
+            ignore_patterns_str="$ep_str"
+        fi
+    fi
+
+    # Build pipe-delimited include string
+    local include_patterns_str=""
+    if [[ -n "$include_patterns" ]]; then
+        local ip_arr=($include_patterns)
+        include_patterns_str="$(IFS='|'; echo "${ip_arr[*]}")"
+    fi
+
+    # Print directory tree if requested and target is a directory
+    if $tree_mode && ! $is_file; then
+        print_tree "$root_dir" "$max_depth" "$color_mode" \
+                   "$ignore_patterns_str" "$include_patterns_str"
+    fi
+
+    # Discover files
+    local file_list=()
+    if $is_file; then
+        file_list+=("$(basename -- "$target")")
+    elif $force_ignore_emulation; then
+        if ! $silent_mode; then
+            printf "${YELLOW}Warning: Using custom ignore emulation instead of git${RESET}\n" >&2
+        fi
+        local find_opts=()
+        [[ -n "$max_depth" ]] && find_opts+=(-maxdepth "$max_depth")
+        $follow_symlinks && find_opts+=(-L)
+
+        while IFS= read -r -d $'\0' file; do
+            file_list+=("${file#$root_dir/}")
+        done < <(find "$root_dir" "${find_opts[@]}" \( -type f -o -type l \) -print0 2>/dev/null)
+    elif ! $no_gitignore && command -v git &>/dev/null && \
+         git -C "$root_dir" rev-parse --is-inside-work-tree &>/dev/null; then
+        while IFS= read -r -d $'\0' file; do
+            file_list+=("$file")
+        done < <(git -C "$root_dir" ls-files -z --cached --others --exclude-standard)
+    else
+        local find_opts=()
+        [[ -n "$max_depth" ]] && find_opts+=(-maxdepth "$max_depth")
+        $follow_symlinks && find_opts+=(-L)
+
+        while IFS= read -r -d $'\0' file; do
+            file_list+=("${file#$root_dir/}")
+        done < <(find "$root_dir" "${find_opts[@]}" \( -type f -o -type l \) -print0 2>/dev/null)
+    fi
+
+    # Apply collected ignore patterns
+    if [[ ${#ignore_patterns[@]} -gt 0 ]]; then
+        apply_ignore_patterns file_list "${ignore_patterns[@]}"
+    fi
+
+    # Process files (either in parallel or sequentially)
+    local total_files=${#file_list[@]}
+    local processed_files=0
+
+    if (( parallel_jobs > 1 )) && (( total_files > 0 )); then
+        # Parallel processing
+        local tmp_dir
+        tmp_dir=$(mktemp -d)
+        declare -a tmp_files
+
+        # Export variables for child processes
+        export long_mode color_mode max_size_bytes follow_symlinks
+        export include_patterns exclude_patterns dry_run number_mode full_path_mode
+        export show_metadata show_checksum newer_than_ts older_than_ts
+        export ignore_case interactive_mode silent_mode
+
+        # Create temp file paths
+        for i in "${!file_list[@]}"; do
+            tmp_files[$i]="$tmp_dir/output_$i.txt"
+        done
+
+        # Launch parallel jobs
+        for i in "${!file_list[@]}"; do
+            (
+                file="${file_list[$i]}"
+                process_file "$file" "$root_dir" "$long_mode" "$color_mode" "$max_size_bytes" \
+                             "$follow_symlinks" "$include_patterns" "$exclude_patterns" "$dry_run" \
+                             "$number_mode" "$full_path_mode" "$show_metadata" "$show_checksum" \
+                             "$newer_than_ts" "$older_than_ts" "$ignore_case" "$interactive_mode" \
+                             "$silent_mode" > "${tmp_files[$i]}"
+            ) &
+
+            # Limit parallelism
+            while (( $(jobs -p | wc -l) >= parallel_jobs )); do
+                wait -n
+            done
+        done
+        wait
+
+        # Output results in original order
+        for i in "${!file_list[@]}"; do
+            cat "${tmp_files[$i]}"
+            rm -f "${tmp_files[$i]}"
+        done
+        rmdir "$tmp_dir"
+    else
+        # Sequential processing
+        for file in "${file_list[@]}"; do
+            if $progress_mode; then
+                ((processed_files++))
+                if ! $silent_mode; then
+                    printf "Processing %d/%d: %s\n" "$processed_files" "$total_files" "$file" >&2
+                fi
+            fi
+            process_file "$file" "$root_dir" "$long_mode" "$color_mode" "$max_size_bytes" \
+                         "$follow_symlinks" "$include_patterns" "$exclude_patterns" "$dry_run" \
+                         "$number_mode" "$full_path_mode" "$show_metadata" "$show_checksum" \
+                         "$newer_than_ts" "$older_than_ts" "$ignore_case" "$interactive_mode" \
+                         "$silent_mode"
+        done
+    fi
+
+    # Handle copying to clipboard if requested
+    if $clipboard_mode; then
+        wait  # Ensure all output is written to temp_file
+        clipboard_content=$(<"$temp_file")
+        plain_content=$(echo "$clipboard_content" | strip_ansi)
+        if copy_to_clipboard "$plain_content" "$silent_mode"; then
+            if ! $silent_mode; then
+                printf "${CYAN}Output copied to clipboard${RESET}\n" >&2
+            fi
+        else
+            if ! $silent_mode; then
+                printf "${RED}Error: Failed to copy to clipboard${RESET}\n" >&2
+            fi
+        fi
+        rm -f "$temp_file"
+    fi
+}
+
+main "$@"
