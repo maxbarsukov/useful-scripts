@@ -1,0 +1,20 @@
+### IntelliJ IDEA ###
+.idea
+.idea_modules
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### VS Code ###
+.vscode/
+.code-workspace
+
+### OS Files ###
+.DS_Store
+Thumbs.db
+Desktop.ini
+.svn
+._*
