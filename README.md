@@ -47,7 +47,7 @@ source ~/.bashrc
 
 ### `bump-version` <a name="bump-version"></a>
 
-**Purpose**: Updates project version with semantic versioning and creates Git commit/tag.
+**Purpose**: Updates project version with semantic versioning and creates Git commit/tag. \
 **Use Case**: Automate version management during release workflows.
 
 ```bash
@@ -66,7 +66,7 @@ bump-version 1.2.0
 
 ### `colors` <a name="colors"></a>
 
-**Purpose**: Displays a 256-color palette in terminal.
+**Purpose**: Displays a 256-color palette in terminal. \
 **Use Case**: Test terminal color support and choose color codes for scripts.
 
 ```bash
@@ -218,7 +218,7 @@ underscores2spaces ~/data
 
 ### `waitfor` <a name="waitfor"></a>
 
-**Purpose**: Monitors a process and executes a predefined action when the process terminates.
+**Purpose**: Monitors a process and executes a predefined action when the process terminates. \
 **Use Case**: Automate cleanup tasks or shutdown sequences after long-running processes complete.
 
 ```bash
