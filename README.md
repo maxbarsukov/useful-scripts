@@ -8,10 +8,11 @@ This project provides a set of utility that were once useful to me and, hopefull
 2. [Scripts](#scripts)
     1. [`bump-version`](#bump-version)
     2. [`colors`](#colors)
-    3. [`show-files`](#show-files)
-    4. [`spaces2underscores`](#spaces2underscores)
-    5. [`underscores2spaces`](#underscores2spaces)
-    6. [`waitfor`](#waitfor)
+    3. [`download-website`](#download-website)
+    4. [`show-files`](#show-files)
+    6. [`spaces2underscores`](#spaces2underscores)
+    7. [`underscores2spaces`](#underscores2spaces)
+    8. [`waitfor`](#waitfor)
 3. [Contributing](#contributing)
 4. [Code of Conduct](#code-of-conduct)
 5. [License](#license)
@@ -45,7 +46,7 @@ source ~/.bashrc
 
 ## Scripts <a name="scripts"></a>
 
-### `bump-version` <a name="bump-version"></a>
+### [`bump-version`](./bin/bump-version) <a name="bump-version"></a>
 
 **Purpose**: Updates project version with semantic versioning and creates Git commit/tag. \
 **Use Case**: Automate version management during release workflows.
@@ -64,7 +65,7 @@ bump-version <semantic-version>
 bump-version 1.2.0
 ```
 
-### `colors` <a name="colors"></a>
+### [`colors`](./bin/colors) <a name="colors"></a>
 
 **Purpose**: Displays a 256-color palette in terminal. \
 **Use Case**: Test terminal color support and choose color codes for scripts.
@@ -73,7 +74,33 @@ bump-version 1.2.0
 colors
 ```
 
-### `show-files` <a name="show-files"></a>
+### [`download-website`](./bin/download-website) <a name="download-website"></a>
+
+**Purpose**: Recursively download entire websites. \
+**Use Case**: Create local mirrors of websites for offline viewing, archiving, or analysis.
+
+```bash
+download-website [OPTIONS] URL
+```
+
+#### Dependencies
+
+| Dependency      | Installation                     |
+|-----------------|----------------------------------|
+| `wget`          | `sudo apt install wget`          |
+
+#### Full Options Reference
+
+| Option | Description | Example |
+|--------|-------------|---------|
+| `-o`, `--output` | Custom output directory | `download-website -o backup_dir` |
+| `-u`, `--user-agent` | Custom User-Agent string | `download-website -u "MyBot"` |
+| `-t`, `--timeout` | Connection timeout (seconds) | `download-website -t 10` |
+| `-r`, `--rate-limit` | Download speed limit | `download-website -r 1M` |
+| `-w`, `--wait` | Enable polite delays between requests | `download-website -w` |
+| `-h`, `--help` | Show help message | `download-website -h` |
+
+### [`show-files`](./bin/show-files) <a name="show-files"></a>
 
 #### Purpose
 
@@ -196,7 +223,7 @@ show-files [OPTIONS] [FILE_OR_DIRECTORY]
 | `--interactive` | Prompt before each file | `show-files --interactive` |
 | `-h`, `--help` | Show help message | `show-files -h` |
 
-### `spaces2underscores` <a name="spaces2underscores"></a>
+### [`spaces2underscores`](./bin/spaces2underscores) <a name="spaces2underscores"></a>
 
 **Purpose**: Bulk rename files by replacing spaces with underscores.
 
@@ -206,7 +233,7 @@ show-files [OPTIONS] [FILE_OR_DIRECTORY]
 spaces2underscores ~/docs
 ```
 
-### `underscores2spaces` <a name="underscores2spaces"></a>
+### [`underscores2spaces`](./bin/underscores2spaces) <a name="underscores2spaces"></a>
 
 **Purpose**: Bulk rename files by replacing underscores with spaces.
 
@@ -216,7 +243,7 @@ spaces2underscores ~/docs
 underscores2spaces ~/data
 ```
 
-### `waitfor` <a name="waitfor"></a>
+### [`waitfor`](./bin/waitfor) <a name="waitfor"></a>
 
 **Purpose**: Monitors a process and executes a predefined action when the process terminates. \
 **Use Case**: Automate cleanup tasks or shutdown sequences after long-running processes complete.
